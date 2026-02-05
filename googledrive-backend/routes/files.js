@@ -327,8 +327,28 @@ router.get('/:id/download', protect, async (req, res) => {
       });
     }
 
-    // Generate signed URL for download
-    const downloadUrl = generateSignedUrl(file.s3Key, 3600); // 1 hour expiry
+    // Check if file exists in S3
+    try {
+      await s3.headObject({
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: file.s3Key
+      }).promise();
+    } catch (s3Error) {
+      console.error('File not found in S3:', s3Error);
+      return res.status(404).json({
+        success: false,
+        message: 'File not found in storage'
+      });
+    }
+
+    // Generate signed URL for download with proper headers
+    const downloadUrl = s3.getSignedUrl('getObject', {
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: file.s3Key,
+      Expires: 3600, // 1 hour
+      ResponseContentDisposition: `attachment; filename="${encodeURIComponent(file.name)}"`,
+      ResponseContentType: file.mimeType
+    });
 
     res.json({
       success: true,
@@ -336,7 +356,8 @@ router.get('/:id/download', protect, async (req, res) => {
         downloadUrl,
         fileName: file.name,
         fileSize: file.size,
-        mimeType: file.mimeType
+        mimeType: file.mimeType,
+        expiresIn: 3600
       }
     });
   } catch (error) {
@@ -344,6 +365,67 @@ router.get('/:id/download', protect, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Server error generating download link'
+    });
+  }
+});
+
+// @route   GET /api/files/:id/stream
+// @desc    Stream file directly (alternative to signed URL)
+// @access  Private
+router.get('/:id/stream', protect, async (req, res) => {
+  try {
+    const file = await File.findOne({
+      _id: req.params.id,
+      owner: req.user._id,
+      isDeleted: false
+    });
+
+    if (!file) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found'
+      });
+    }
+
+    // Get file from S3
+    const params = {
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: file.s3Key
+    };
+
+    try {
+      // Set response headers for download
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(file.name)}"`);
+      res.setHeader('Content-Type', file.mimeType);
+      res.setHeader('Content-Length', file.size);
+      res.setHeader('Cache-Control', 'no-cache');
+
+      // Stream file from S3
+      const s3Stream = s3.getObject(params).createReadStream();
+      
+      s3Stream.on('error', (error) => {
+        console.error('S3 stream error:', error);
+        if (!res.headersSent) {
+          res.status(500).json({
+            success: false,
+            message: 'Error streaming file'
+          });
+        }
+      });
+
+      s3Stream.pipe(res);
+    } catch (s3Error) {
+      console.error('S3 error:', s3Error);
+      res.status(404).json({
+        success: false,
+        message: 'File not found in storage'
+      });
+    }
+  } catch (error) {
+    console.error('File stream error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error streaming file'
     });
   }
 });
